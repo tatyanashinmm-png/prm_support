@@ -1,0 +1,231 @@
+# Support Desk — архитектура проекта
+
+Дашборд статистики по обращениям в Telegram-поддержке: сбор сообщений ботом,
+категоризация и дневные сводки через ИИ, фронт на React.
+
+Дизайн-референс (кликабельный прототип, светлая B2B-тема):
+`support_dashboard_prototype.jsx` — считать источником правды по UI/UX
+и структуре разделов при реализации фронта.
+
+---
+
+## 1. Компоненты системы
+
+```
+┌──────────────────┐      ┌──────────────────┐
+│  Bot-collector    │      │  Bot-digest       │
+│  (в чатах         │      │  (шлёт сводки и   │
+│  клиентов)        │      │  напоминания)      │
+└─────────┬─────────┘      └─────────▲─────────┘
+          │ webhook/polling          │ send message
+          ▼                          │
+┌─────────────────────────────────────────────┐
+│              Backend (FastAPI)               │
+│  ┌───────────┐ ┌───────────┐ ┌─────────────┐ │
+│  │ REST API  │ │ Scheduler │ │ LLM adapter │ │
+│  │ (фронт)   │ │ (APSched) │ │ (провайдер  │ │
+│  └───────────┘ └───────────┘ │ подменяемый)│ │
+│                                └─────────────┘ │
+└───────────────┬───────────────────────────────┘
+                 │
+         ┌───────▼────────┐        ┌──────────────────┐
+         │   PostgreSQL    │        │  Oracle sync      │
+         │  (основная БД)  │◄───────│  agent (local)     │
+         └─────────────────┘  SELECT │  забирает клиентов │
+                                     └──────────────────┘
+                 ▲
+                 │ REST
+         ┌───────┴────────┐
+         │  Frontend React │
+         │  (дашборд)      │
+         └─────────────────┘
+```
+
+**Bot-collector** — отдельный Telegram-бот, добавлен в группы поддержки
+клиентов. Слушает все сообщения, шлёт их в backend (`POST /ingest/message`).
+
+**Backend (FastAPI)** — единственная точка правды:
+- REST API для фронта (клиенты, тикеты, настройки);
+- логика открытия/предложения-закрытия тикетов;
+- планировщик (APScheduler) — дневная сводка в 23:00, напоминания о сроках;
+- адаптер к LLM-провайдеру — категоризация и генерация сводок, провайдер
+  подключается по OpenAI-совместимому формату (Gemini / Groq / OpenRouter —
+  просто смена `base_url` и модели в настройках).
+
+**Bot-digest** — второй бот, шлёт готовую сводку и напоминания в отдельный
+служебный чат. Backend вызывает его через простой HTTP-вызов к Bot API.
+
+**PostgreSQL** — основное хранилище (клиенты, тикеты/сообщения, сводки,
+настройки, обещания).
+
+**Oracle sync agent** — небольшой скрипт на вашей машине (доступ к Oracle
+есть только локально). Выполняет заданный `SELECT`, отдаёт результат в
+backend через `POST /clients/sync`. Запускается по расписанию или по кнопке
+«Запустить синхронизацию» в дашборде (дашборд дёргает backend, backend
+дёргает agent через тот же принцип — локальный воркер, который поллит
+очередь заданий на синк, либо просто по cron на машине с доступом в Oracle).
+
+**Frontend (React)** — дашборд, разделы: Клиенты, Обращения, Сегодня,
+Обещания, Настройки. Полностью описан в прототипе.
+
+---
+
+## 2. Модель данных (PostgreSQL)
+
+```sql
+-- Клиенты, подтягиваются синком из Oracle
+CREATE TABLE clients (
+  id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  name          TEXT NOT NULL,
+  tg_group_id   BIGINT NOT NULL UNIQUE,
+  chat_label    TEXT,                 -- короткое имя чата для UI
+  active        BOOLEAN NOT NULL DEFAULT TRUE,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Сырые сообщения из чатов (для истории/аудита и переанализа)
+CREATE TABLE messages (
+  id            BIGSERIAL PRIMARY KEY,
+  client_id     UUID NOT NULL REFERENCES clients(id),
+  tg_message_id BIGINT NOT NULL,
+  sender_type   TEXT NOT NULL CHECK (sender_type IN ('client','agent')),
+  sender_name   TEXT,
+  text          TEXT NOT NULL,
+  sent_at       TIMESTAMPTZ NOT NULL,
+  ticket_id     BIGINT REFERENCES tickets(id)
+);
+
+-- Обращения
+CREATE TABLE tickets (
+  id                BIGSERIAL PRIMARY KEY,
+  code              TEXT UNIQUE NOT NULL,         -- SUP-1042
+  client_id         UUID NOT NULL REFERENCES clients(id),
+  category          TEXT NOT NULL,                -- ставит LLM
+  status            TEXT NOT NULL DEFAULT 'open'
+                     CHECK (status IN ('open','pending_confirm','closed')),
+  subject           TEXT NOT NULL,                -- краткое описание от LLM
+  first_message_at  TIMESTAMPTZ NOT NULL,
+  first_response_at TIMESTAMPTZ,
+  closed_at         TIMESTAMPTZ,
+  ai_confidence     SMALLINT,                     -- уверенность LLM, 0-100
+  promise_text      TEXT,                         -- что пообещали клиенту
+  jira_url          TEXT,
+  due_date          DATE,
+  created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX ON tickets (client_id, first_message_at);
+CREATE INDEX ON tickets (status);
+
+-- Дневные сводки
+CREATE TABLE daily_summaries (
+  id            BIGSERIAL PRIMARY KEY,
+  summary_date  DATE NOT NULL UNIQUE,
+  summary_text  TEXT NOT NULL,
+  model_used    TEXT NOT NULL,
+  generated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  sent_at       TIMESTAMPTZ
+);
+
+-- Настройки ИИ и SLA-порогов (одна активная строка, либо key-value)
+CREATE TABLE settings (
+  key           TEXT PRIMARY KEY,
+  value         JSONB NOT NULL
+  -- ключи: ai_provider, ai_model, ai_api_key (шифрованный),
+  -- target_first_response_min, attention_after_min, auto_confidence_pct,
+  -- toggles: auto_close, auto_promise, daily_digest, remind_before_due
+);
+```
+
+Метрики за период (7/30/90 дней, произвольный диапазон) и «среднее в месяц
+по темам» на клиента — это обычные агрегирующие запросы `WHERE
+first_message_at BETWEEN ... GROUP BY category`. Материализация в отдельную
+таблицу не нужна, пока объём не вырастет настолько, что агрегаты станут
+дорогими on the fly.
+
+---
+
+## 3. Жизненный цикл обращения
+
+1. Клиент пишет в группу → bot-collector сохраняет сообщение.
+2. Если это первое сообщение без активного тикета — backend создаёт тикет
+   `status = open`, LLM асинхронно ставит `category`, `subject`,
+   `ai_confidence`.
+3. Агент отвечает в чате → `first_response_at` фиксируется, время ответа
+   считается как `first_response_at - first_message_at`.
+4. Если после ответа агента в чате нет активности N часов (настраиваемый
+   порог) и уверенность LLM выше порога автозакрытия — тикет переходит в
+   `pending_confirm` с пояснением от LLM. Менеджер подтверждает или
+   отклоняет в UI (боковая панель тикета).
+5. Менеджер вручную ставит `closed`, либо подтверждает предложение LLM.
+6. Если в переписке агент что-то пообещал — поля `promise_text`,
+   `jira_url`, `due_date` заполняются вручную через боковую панель.
+
+---
+
+## 4. REST API (контракт, версия для MVP)
+
+```
+GET    /clients                         — список клиентов с агрегатами
+GET    /clients/{id}                    — карточка клиента
+GET    /clients/{id}/tickets?period=... — история обращений за период
+GET    /clients/{id}/category-stats     — темы, среднее в месяц
+POST   /clients/sync                    — принять результат Oracle-синка
+
+GET    /tickets?view=open|sla_breach|pending|repeat|no_jira&period=...
+GET    /tickets/{id}
+PATCH  /tickets/{id}                    — статус, promise, jira_url, due_date
+
+GET    /digest/today                    — сводка + метрики дня
+POST   /digest/regenerate               — пересобрать сводку через LLM
+POST   /digest/send                     — отправить в чат сводок
+
+GET    /promises?bucket=overdue|today|week
+PATCH  /promises/{ticket_id}            — отметить выполненным
+
+GET    /settings
+PATCH  /settings                        — модель ИИ, ключ, пороги, тумблеры
+POST   /settings/test-key               — проверка API-ключа провайдера
+
+POST   /ingest/message                  — вызывается bot-collector'ом
+```
+
+---
+
+## 5. Стек
+
+| Слой                | Технология                                           |
+|---------------------|-------------------------------------------------------|
+| Backend             | Python, FastAPI                                       |
+| Боты                | aiogram (2 инстанса: collector, digest)                |
+| БД                  | PostgreSQL                                             |
+| Планировщик         | APScheduler (в процессе backend) или Celery beat       |
+| LLM                 | OpenAI-совместимый адаптер → Gemini / Groq / OpenRouter |
+| Oracle-синк         | python `oracledb`, локальный воркер/cron                |
+| Frontend            | React, компоненты как в прототипе                       |
+| Инфраструктура      | Docker Compose (backend, боты, Postgres) + отдельный процесс синка на машине с доступом в Oracle |
+
+---
+
+## 6. План реализации по чатам
+
+Работу удобно вести отдельными чатами по модулям — так контекст каждого
+чата остаётся сфокусированным, а модули можно делать параллельно или
+последовательно без потери качества из-за раздутого контекста. Порядок
+ниже — рекомендуемая последовательность (backend-ядро раньше всего, так
+как от него зависят боты и фронт).
+
+1. **Backend-ядро и схема БД** — FastAPI + Postgres, модели, миграции,
+   базовые CRUD-эндпоинты, docker-compose для локальной разработки.
+2. **Bot-collector** — приём сообщений из чатов клиентов, запись в БД,
+   логика открытия тикета.
+3. **LLM-конвейер** — категоризация, предложение автозакрытия, генерация
+   дневной сводки (адаптер под несколько провайдеров).
+4. **Bot-digest и напоминания** — отправка сводки и уведомлений о сроках.
+5. **Oracle-синк** — локальный агент, эндпоинт приёма результата.
+6. **Frontend-интеграция** — подключение готового прототипа к реальному
+   API вместо моковых данных, экран настроек — к `/settings`.
+7. **Деплой и эксплуатация** — Docker Compose, секреты, логирование,
+   бэкапы Postgres.
+
+Готовые промпты для старта каждого чата — в сообщении в диалоге ниже.
