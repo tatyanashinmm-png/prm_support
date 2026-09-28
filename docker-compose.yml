@@ -1,0 +1,54 @@
+version: "3.9"
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: support
+      POSTGRES_PASSWORD: support
+      POSTGRES_DB: support_desk
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U support -d support_desk"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build: ./backend
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+psycopg2://support:support@db:5432/support_desk
+      BOT_SERVICE_KEY: ${BOT_SERVICE_KEY:-}
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend/app:/app/app
+
+  bot-collector:
+    build: ./bot-collector
+    restart: unless-stopped
+    depends_on:
+      - backend
+    environment:
+      BACKEND_URL: http://backend:8000
+      TOKEN_POLL_INTERVAL_SEC: 20
+      BOT_SERVICE_KEY: ${BOT_SERVICE_KEY:-}
+    volumes:
+      - ./bot-collector:/app
+
+  frontend:
+    build: ./frontend
+    restart: unless-stopped
+    ports:
+      - "5173:80"
+
+volumes:
+  pgdata:
